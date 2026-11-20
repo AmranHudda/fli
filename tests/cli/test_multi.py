@@ -350,3 +350,69 @@ class TestMultiCityValidation:
         assert "validation error for" not in result.stdout.lower()
         assert "infants_on_lap" in result.stdout
         mock_search_flights.search.assert_not_called()
+
+
+class TestCompareSeparate:
+    """`--compare-separate` prices each leg as a one-way and reports the comparison."""
+
+    def test_json_carries_the_comparison(self, runner, mock_search_flights, monkeypatch):
+        import json
+
+        from fli.search.separate import SeparateTickets
+
+        mock_search_flights.search.return_value = _make_multi_city_results()
+        mock_search_flights.build_flight_booking_url.return_value = "https://example.test/book"
+        one_way = mock_search_flights.search.return_value[0][0]
+        captured = {}
+
+        def _separate(filters, **kwargs):  # noqa: ANN001
+            captured["legs"] = len(filters.flight_segments)
+            captured["currency"] = kwargs.get("currency")
+            return SeparateTickets(legs=(one_way,) * len(filters.flight_segments))
+
+        monkeypatch.setattr("fli.cli.commands.multi.search_separate_tickets", _separate)
+        result = runner.invoke(
+            app,
+            [
+                "multi",
+                "-l",
+                f"SEA,NRT,{_future_date(30)}",
+                "-l",
+                f"NRT,HKG,{_future_date(34)}",
+                "-l",
+                f"HKG,SEA,{_future_date(40)}",
+                "--compare-separate",
+                "--format",
+                "json",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        summary = payload["separate_tickets"]
+        assert captured == {"legs": 3, "currency": "USD"}
+        assert summary["separate_total"] == one_way.price * 3
+        assert len(summary["legs"]) == 3
+        assert summary["cheaper"] in {"separate", "one_ticket", "same"}
+
+    def test_comparison_is_off_by_default(self, runner, mock_search_flights, monkeypatch):
+        import json
+
+        def _never(*args, **kwargs):  # noqa: ANN002, ANN003
+            raise AssertionError("separate tickets searched without --compare-separate")
+
+        monkeypatch.setattr("fli.cli.commands.multi.search_separate_tickets", _never)
+        result = runner.invoke(
+            app,
+            [
+                "multi",
+                "-l",
+                f"SEA,HKG,{_future_date(30)}",
+                "-l",
+                f"HKG,SEA,{_future_date(37)}",
+                "--format",
+                "json",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "separate_tickets" not in json.loads(result.output)

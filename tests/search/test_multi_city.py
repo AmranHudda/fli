@@ -42,9 +42,9 @@ def _future(days: int) -> str:
 
 
 def _filters(legs, **overrides) -> FlightSearchFilters:
+    overrides = {"passenger_info": PassengerInfo(adults=1), **overrides}
     return FlightSearchFilters(
         trip_type=TripType.MULTI_CITY,
-        passenger_info=PassengerInfo(adults=1),
         flight_segments=[
             FlightSegment(
                 departure_airport=[[origin, 0]],
@@ -325,3 +325,86 @@ class TestBookingLinkTripType:
             self._pair(("JFK", "LAX"), ("LAX", "JFK")), trip_type=TripType.MULTI_CITY
         )
         assert self._trip_code(url) == 3
+
+
+REFUSED = ')]}\'\n\n[["wrb.fr",null,null,null,null,[13]]]'
+INVALID = ')]}\'\n\n[["wrb.fr",null,null,null,null,[3]]]'
+
+
+class TestIntermittentRefusals:
+    """Google refuses a share of multi-city boards with error 13, in clusters."""
+
+    @pytest.fixture
+    def no_sleep(self, monkeypatch):
+        delays: list[float] = []
+        monkeypatch.setattr("fli.search.flights._sleep", delays.append)
+        return delays
+
+    @staticmethod
+    def _serve(monkeypatch, refuse):
+        """Serve the canned boards, refusing a URL while ``refuse(url, n)`` is true.
+
+        ``n`` counts earlier requests for the same URL.
+        """
+        counts: dict[str, int] = {}
+
+        def _fetch(url: str) -> str:
+            n = counts.get(url, 0)
+            counts[url] = n + 1
+            if refuse(url, n):
+                return REFUSED
+            raw = _tfs_bytes(url)
+            for number, rows in SECOND_BOARDS.items():
+                if number in raw:
+                    return _rpc_body(rows)
+            return _rpc_body(FIRST_BOARD)
+
+        monkeypatch.setattr(_browser, "fetch_shopping_body", _fetch)
+        return counts
+
+    def test_refused_board_is_retried(self, monkeypatch, no_sleep):
+        self._serve(monkeypatch, lambda url, n: n < 2)
+        combos = SearchFlights().search(_open_jaw(sort_by=SortBy.CHEAPEST), top_n=2)
+        assert [combo_price(c) for c in combos] == [2133, 2334, 2418, 8685]
+        assert no_sleep, "expected backoff between attempts"
+
+    def test_persistently_refused_option_is_skipped_with_a_warning(
+        self, monkeypatch, no_sleep, caplog
+    ):
+        self._serve(monkeypatch, lambda url, n: b"2222" in _tfs_bytes(url))
+        with caplog.at_level("WARNING", logger="fli.search.flights"):
+            combos = SearchFlights().search(_open_jaw(sort_by=SortBy.CHEAPEST), top_n=2)
+
+        assert {c[0].legs[0].flight_number for c in combos} == {"1111"}
+        assert any("Skipped 1 of 2" in r.getMessage() for r in caplog.records)
+
+    def test_every_option_refused_raises_retryable(self, monkeypatch, no_sleep):
+        self._serve(
+            monkeypatch, lambda url, n: b"1111" in _tfs_bytes(url) or b"2222" in _tfs_bytes(url)
+        )
+        with pytest.raises(SearchRejectedError) as info:
+            SearchFlights().search(_open_jaw(), top_n=2)
+        assert info.value.retryable is True
+
+    def test_first_board_refused_on_every_attempt_raises_retryable(self, monkeypatch, no_sleep):
+        from fli.search.flights import MULTI_CITY_ATTEMPTS
+
+        counts = self._serve(monkeypatch, lambda url, n: True)
+        with pytest.raises(SearchRejectedError) as info:
+            SearchFlights().search(_open_jaw())
+        assert info.value.retryable is True
+        assert sum(counts.values()) == MULTI_CITY_ATTEMPTS
+
+    def test_other_rejections_are_not_retried(self, monkeypatch, no_sleep):
+        calls: list[str] = []
+
+        def _fetch(url: str) -> str:
+            calls.append(url)
+            return INVALID
+
+        monkeypatch.setattr(_browser, "fetch_shopping_body", _fetch)
+        with pytest.raises(SearchRejectedError) as info:
+            SearchFlights().search(_open_jaw())
+        assert info.value.code == 3
+        assert len(calls) == 1
+        assert no_sleep == []

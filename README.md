@@ -51,7 +51,7 @@ The MCP server provides these main tools:
 | Tool                 | Description                                                 |
 |----------------------|-------------------------------------------------------------|
 | **`search_flights`** | Search for flights on a specific date with detailed filters |
-| **`search_multi_city`** | Multi-city and open-jaw trips priced as one ticket (needs the `browser` extra) |
+| **`search_multi_city`** | Multi-city and open-jaw trips priced as one ticket, compared with separate one-way tickets (needs the `browser` extra) |
 | **`search_dates`**   | Find the cheapest travel dates across a flexible date range |
 | **`search_explore`** | Discover cheap destinations from an origin ("fly anywhere") |
 
@@ -236,7 +236,10 @@ What that means in practice:
   `BrowserUnavailableError` (a `SearchUnsupportedError`) with install steps.
   Settings: `FLI_BROWSER_CHANNEL` (default `chrome`), `FLI_BROWSER_HEADLESS=0`
   to watch it, `FLI_BROWSER_PAGES` (concurrent pages, default 4) and
-  `FLI_BROWSER_TIMEOUT` (seconds per page, default 30).
+  `FLI_BROWSER_TIMEOUT` (seconds per page, default 20). Google refuses a
+  share of multi-city requests with error 13 even though its own page signed
+  them; each board is retried up to four times, and an option whose next-leg
+  board stays refused is skipped with a warning rather than failing the search.
 * **Round-trip and multi-city prices come from the last direction's board.**
   The first board lists the cheapest total each outbound can be part of; the
   next board, fetched with that outbound pinned, quotes the exact total for
@@ -369,6 +372,9 @@ fli multi -l BOS,FCO,2027-05-10 -l MXP,BOS,2027-05-24 --format json
 # Expand more first-leg options (default 3)
 fli multi -l BOS,FCO,2027-05-10 -l MXP,BOS,2027-05-24 --top-n 6
 
+# Also price each leg as its own one-way ticket and compare the totals
+fli multi -l BOS,FCO,2027-05-10 -l MXP,BOS,2027-05-24 --compare-separate
+
 # Three-leg multi-city trip with filters
 fli multi \
     -l SEA,NRT,2026-12-26 \
@@ -457,6 +463,7 @@ fli multi \
 | `--top-n, -n`    | Options per leg expanded into the next leg (default 3) | `5`              |
 | `--currency`     | Currency for prices                  | `USD`, `EUR`                   |
 | `--format`       | Output format                        | `text`, `json`                 |
+| `--compare-separate, -x` | Also price each leg as a one-way and compare with one ticket | |
 
 ## MCP Server Integration
 

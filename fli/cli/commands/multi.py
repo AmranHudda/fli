@@ -5,7 +5,10 @@ from typing import Annotated, Any
 
 import typer
 from pydantic import ValidationError
+from rich import box
+from rich.table import Table
 
+from fli.cli.console import console
 from fli.cli.enums import OutputFormat
 from fli.cli.errors import json_error_payload, report_cli_error
 from fli.cli.utils import (
@@ -20,6 +23,7 @@ from fli.cli.utils import (
 from fli.core import (
     build_multi_city_segments,
     classify_error,
+    format_price,
     format_validation_error,
     normalize_date,
     parse_airlines,
@@ -30,12 +34,19 @@ from fli.core import (
 )
 from fli.core.parsers import ParseError
 from fli.models import (
+    FlightResult,
     FlightSearchFilters,
     PassengerInfo,
     TimeRestrictions,
+    TripType,
 )
 from fli.search import SearchClientError, SearchFlights
 from fli.search._tfs import build_tfs, page_url
+from fli.search.separate import (
+    SeparateTickets,
+    compare_with_one_ticket,
+    search_separate_tickets,
+)
 
 LEG_PATTERN = re.compile(r"^([A-Za-z]{3}),([A-Za-z]{3}),(\d{4}-\d{1,2}-\d{1,2})$")
 
@@ -56,6 +67,99 @@ def _parse_leg(value: str) -> tuple[str, str, str]:
             f"Invalid leg format: '{value}'. Expected ORIGIN,DEST,DATE (e.g., SEA,HKG,2026-12-26)"
         )
     return match.group(1).upper(), match.group(2).upper(), match.group(3)
+
+
+def _separate_tickets(
+    filters: FlightSearchFilters,
+    one_ticket: list[tuple[FlightResult, ...]] | None,
+    client: SearchFlights,
+    currency: str,
+) -> tuple[SeparateTickets | None, dict[str, Any]]:
+    """Price each leg as a one-way and summarise it against the one-ticket results.
+
+    Best effort: a failure here is reported in the summary and never sinks the
+    multi-city results the user asked for.
+    """
+    try:
+        separate = search_separate_tickets(filters, currency=currency)
+    except Exception as exc:  # noqa: BLE001 — comparison is optional output
+        return None, {"error": str(exc)}
+    summary = compare_with_one_ticket(separate, one_ticket)
+    summary["legs"] = [
+        None
+        if leg is None
+        else serialize_flight_result(
+            leg,
+            default_currency=currency,
+            booking_url=client.build_flight_booking_url(
+                leg,
+                currency=currency,
+                seat_type=filters.seat_type,
+                passenger_info=filters.passenger_info,
+                trip_type=TripType.ONE_WAY,
+            ),
+        )
+        for leg in separate.legs
+    ]
+    return separate, summary
+
+
+def _print_separate_tickets(
+    separate: SeparateTickets | None,
+    summary: dict[str, Any],
+    legs: list[dict[str, str]],
+    currency: str,
+) -> None:
+    """Render the separate-tickets comparison under the multi-city results."""
+    if separate is None:
+        console.print(f"[yellow]Separate tickets: could not price ({summary['error']})[/yellow]")
+        return
+
+    money = summary["currency"] or currency
+    table = Table(
+        title="Separate tickets (cheapest one-way per leg)",
+        box=box.SIMPLE,
+        title_justify="left",
+    )
+    table.add_column("Leg", style="blue")
+    table.add_column("Date")
+    table.add_column("Flights", style="green")
+    table.add_column("Price", justify="right")
+    for query_leg, flight in zip(legs, separate.legs, strict=False):
+        route = f"{query_leg['origin']} → {query_leg['destination']}"
+        if flight is None:
+            table.add_row(route, query_leg["departure_date"], "no one-way fare found", "-")
+            continue
+        flights = ", ".join(
+            f"{leg.airline.name.lstrip('_')}{leg.flight_number} "
+            f"{leg.departure_airport.name.lstrip('_')}-{leg.arrival_airport.name.lstrip('_')}"
+            for leg in flight.legs
+        )
+        table.add_row(
+            route,
+            query_leg["departure_date"],
+            flights,
+            format_price(flight.price, flight.currency or money),
+        )
+    table.add_row(
+        "",
+        "",
+        "[bold]Total[/bold]",
+        f"[bold]{format_price(summary['separate_total'], money)}[/bold]",
+    )
+    console.print(table)
+
+    difference = summary["difference"]
+    if difference is not None:
+        one_ticket = format_price(summary["one_ticket_total"], money)
+        if difference < 0:
+            verdict = f"[green]Separate tickets save {format_price(-difference, money)}[/green]"
+        elif difference > 0:
+            verdict = f"One ticket is {format_price(difference, money)} cheaper"
+        else:
+            verdict = "Same price either way"
+        console.print(f"Cheapest one ticket: {one_ticket}. {verdict}.")
+    console.print(f"[dim]{summary['note']}[/dim]")
 
 
 def multi(
@@ -170,6 +274,17 @@ def multi(
             help="Currency code (USD, EUR, GBP, JPY...). Passed to Google as `curr=`.",
         ),
     ] = "USD",
+    compare_separate: Annotated[
+        bool,
+        typer.Option(
+            "--compare-separate",
+            "-x",
+            help=(
+                "Also price each leg as its own one-way ticket and compare the total "
+                "with the cheapest one-ticket price."
+            ),
+        ),
+    ] = False,
 ):
     """Search for multi-city flights with multiple legs.
 
@@ -184,6 +299,7 @@ def multi(
         fli multi -l SEA,NRT,2026-12-26 -l NRT,HKG,2026-12-30 -l HKG,SEA,2027-01-05 -c BUSINESS
         fli multi -l SEA,NRT,2026-12-26 -l HKG,SEA,2027-01-05 --passengers 2
         fli multi -l SEA,NRT,2026-12-26 -l HKG,SEA,2027-01-05 --passengers 2 --children 1
+        fli multi -l BOS,FCO,2027-05-10 -l MXP,BOS,2027-05-24 --compare-separate
 
     """
     query: dict[str, Any] = {
@@ -271,19 +387,29 @@ def multi(
         search_client = SearchFlights()
         results = search_client.search(filters, top_n=top_n, currency=currency)
 
+        separate: SeparateTickets | None = None
+        separate_summary: dict[str, Any] | None = None
+        if compare_separate:
+            separate, separate_summary = _separate_tickets(
+                filters, results, search_client, currency
+            )
+
         if not results:
             if json_mode:
-                emit_json(
-                    build_json_success_response(
-                        search_type="flights",
-                        trip_type=trip_type,
-                        query=query,
-                        results_key="flights",
-                        results=[],
-                        booking_url=search_url,
-                    )
+                payload = build_json_success_response(
+                    search_type="flights",
+                    trip_type=trip_type,
+                    query=query,
+                    results_key="flights",
+                    results=[],
+                    booking_url=search_url,
                 )
+                if separate_summary is not None:
+                    payload["separate_tickets"] = separate_summary
+                emit_json(payload)
                 return
+            if separate_summary is not None:
+                _print_separate_tickets(separate, separate_summary, query["legs"], currency)
             typer.echo("No flights found.")
             raise typer.Exit(1)
 
@@ -299,19 +425,20 @@ def multi(
         ]
 
         if json_mode:
-            emit_json(
-                build_json_success_response(
-                    search_type="flights",
-                    trip_type=trip_type,
-                    query=query,
-                    results_key="flights",
-                    results=[
-                        serialize_flight_result(result, default_currency=currency, booking_url=url)
-                        for result, url in zip(results, booking_urls, strict=False)
-                    ],
-                    booking_url=search_url,
-                )
+            payload = build_json_success_response(
+                search_type="flights",
+                trip_type=trip_type,
+                query=query,
+                results_key="flights",
+                results=[
+                    serialize_flight_result(result, default_currency=currency, booking_url=url)
+                    for result, url in zip(results, booking_urls, strict=False)
+                ],
+                booking_url=search_url,
             )
+            if separate_summary is not None:
+                payload["separate_tickets"] = separate_summary
+            emit_json(payload)
             return
 
         display_flight_results(
@@ -321,6 +448,8 @@ def multi(
             booking_url=search_url,
             booking_urls=booking_urls,
         )
+        if separate_summary is not None:
+            _print_separate_tickets(separate, separate_summary, query["legs"], currency)
 
     except ParseError as e:
         raise fail(e, str(e)) from e

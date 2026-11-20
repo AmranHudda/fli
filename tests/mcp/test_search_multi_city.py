@@ -19,7 +19,7 @@ def _params(**overrides) -> MultiCitySearchParams:
             MultiCityLeg(origin="FCO", destination="ORD", departure_date=_future(44)),
         ],
         sort_by="CHEAPEST",
-        **overrides,
+        **{"compare_separate_tickets": False, **overrides},
     )
 
 
@@ -101,3 +101,47 @@ def test_unknown_airport_is_a_validation_error(monkeypatch):
     )
     assert response["success"] is False
     assert response["error_type"] == "validation_error"
+
+
+def test_separate_tickets_are_compared_by_default(monkeypatch):
+    from fli.search.separate import SeparateTickets
+    from tests.search.test_separate_tickets import _result
+
+    _serve_boards(monkeypatch)
+    captured = {}
+
+    def _separate(filters, **kwargs):  # noqa: ANN001
+        captured["legs"] = len(filters.flight_segments)
+        return SeparateTickets(
+            legs=(
+                _result("UA", "1796", "BOS", "FCO", 1236),
+                _result("LH", "763", "FCO", "ORD", 628),
+            )
+        )
+
+    monkeypatch.setattr("fli.mcp.server.search_separate_tickets", _separate)
+    response = _execute_multi_city_search(_params(top_n=2, compare_separate_tickets=True))
+
+    summary = response["separate_tickets"]
+    assert captured["legs"] == 2
+    assert summary["separate_total"] == 1864
+    assert summary["one_ticket_total"] == 2133
+    assert summary["difference"] == -269
+    assert summary["cheaper"] == "separate"
+    assert [leg["legs"][0]["flight_number"] for leg in summary["legs"]] == ["1796", "763"]
+    assert _trip_code(summary["legs"][0]["booking_url"]) == 2  # one-way deep link
+    assert "note" in summary
+
+
+def test_separate_ticket_failure_does_not_fail_the_search(monkeypatch):
+    _serve_boards(monkeypatch)
+
+    def _boom(filters, **kwargs):  # noqa: ANN001
+        raise RuntimeError("one-way search exploded")
+
+    monkeypatch.setattr("fli.mcp.server.search_separate_tickets", _boom)
+    response = _execute_multi_city_search(_params(top_n=2, compare_separate_tickets=True))
+
+    assert response["success"] is True
+    assert response["count"] == 4
+    assert "one-way search exploded" in response["separate_tickets"]["error"]

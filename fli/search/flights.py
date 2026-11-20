@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 import urllib.parse
 from collections.abc import Callable
 from copy import deepcopy
@@ -42,7 +43,7 @@ from fli.search._urls import with_locale_params
 from fli.search._urls import with_locale_params as _with_locale_params  # noqa: F401
 from fli.search._wire import iter_wrb_chunks, parse_first_wrb_payload
 from fli.search.client import get_client
-from fli.search.exceptions import SearchParseError
+from fli.search.exceptions import SearchParseError, SearchRejectedError
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,21 @@ def _has_children_or_infants(passenger_info: PassengerInfo) -> bool:
         passenger_info.children + passenger_info.infants_on_lap + passenger_info.infants_in_seat > 0
     )
 
+
+# Google refuses a share of multi-city board requests with error 13 even
+# though its own page script signed them, and the refusals cluster: measured
+# 2026-11-20, one to three of six pinned boards per run, and the same board
+# loads fine moments later. Retried like Explore's error 13
+# (``fli.search.explore``); the worst case adds ~6 s to one board.
+MULTI_CITY_ATTEMPTS = 4
+MULTI_CITY_RETRY_BACKOFF = (1.0, 2.0, 3.0)
+_MULTI_CITY_HINT = (
+    "Google refuses a share of multi-city requests intermittently, and refused "
+    "this one on every attempt. Retry after a few seconds."
+)
+
+# Indirection so tests can observe the backoff without sleeping.
+_sleep = time.sleep
 
 # Multi-city boards load in a browser at roughly 2-6 seconds each, and the
 # expansion tree grows as top_n ** depth. Past this many pages a search is
@@ -510,14 +526,33 @@ class SearchFlights:
         as the page's inline ``ds:1`` payload: rows at ``[2]`` and ``[3]``.
         """
         url = page_url(build_tfs(filters, allow_multi_city=True), currency, language, country)
-        body = _browser.fetch_shopping_body(url)
-        inner = parse_first_wrb_payload(body)
-        if inner is None:
-            raise SearchParseError(
-                "The multi-city results request returned no payload — Google may "
-                "have changed the response shape."
-            )
-        return inner
+        for attempt in range(1, MULTI_CITY_ATTEMPTS + 1):
+            body = _browser.fetch_shopping_body(url)
+            try:
+                inner = parse_first_wrb_payload(body)
+            except SearchRejectedError as exc:
+                if exc.code != 13:
+                    raise
+                if attempt == MULTI_CITY_ATTEMPTS:
+                    raise SearchRejectedError(
+                        exc.code, detail=exc.detail, hint=_MULTI_CITY_HINT, retryable=True
+                    ) from exc
+                delay = MULTI_CITY_RETRY_BACKOFF[min(attempt, len(MULTI_CITY_RETRY_BACKOFF)) - 1]
+                logger.info(
+                    "Multi-city board refused with error 13 (attempt %d of %d); retrying in %.0fs",
+                    attempt,
+                    MULTI_CITY_ATTEMPTS,
+                    delay,
+                )
+                _sleep(delay)
+                continue
+            if inner is None:
+                raise SearchParseError(
+                    "The multi-city results request returned no payload — Google may "
+                    "have changed the response shape."
+                )
+            return inner
+        raise AssertionError("unreachable")  # pragma: no cover
 
     def get_booking_options(
         self,
@@ -819,6 +854,18 @@ class SearchFlights:
         candidates = list(flights[:top_n])
 
         def expand(outbound: FlightResult):
+            if filters.trip_type != TripType.MULTI_CITY:
+                return expand_one(outbound)
+            # A multi-city board Google kept refusing loses one candidate, not
+            # the whole search; the loop below raises if every candidate fails.
+            try:
+                return expand_one(outbound)
+            except SearchRejectedError as exc:
+                if not exc.retryable:
+                    raise
+                return outbound, exc
+
+        def expand_one(outbound: FlightResult):
             next_filters = deepcopy(filters)
             next_filters.flight_segments[selected_count].selected_flight = outbound
             sub_flights = self._fetch_flights(
@@ -848,9 +895,21 @@ class SearchFlights:
 
         expansions = parallel_map(expand, candidates)
 
+        refused = [result for _, result in expansions if isinstance(result, Exception)]
+        if refused:
+            if len(refused) == len(expansions):
+                raise refused[0]
+            logger.warning(
+                "Skipped %d of %d options for leg %d: Google kept refusing their "
+                "next-leg results. Results are partial; retrying may fill them in.",
+                len(refused),
+                len(expansions),
+                selected_count + 1,
+            )
+
         combos: list[tuple[FlightResult, ...]] = []
         for outbound, next_results in expansions:
-            if next_results is None:
+            if next_results is None or isinstance(next_results, Exception):
                 continue
             for nxt in next_results:
                 if isinstance(nxt, tuple):

@@ -62,6 +62,7 @@ from fli.search.flights import (
     combo_price_segment,
     multi_city_page_count,
 )
+from fli.search.separate import compare_with_one_ticket, search_separate_tickets
 
 
 class FlightSearchConfig(BaseSettings):
@@ -282,6 +283,7 @@ class MultiCitySearchParams(BaseModel):
     language: str | None = None
     country: str | None = None
     top_n: int = Field(3, ge=1, le=10)
+    compare_separate_tickets: bool = True
 
 
 class DateSearchParams(BaseModel):
@@ -969,6 +971,45 @@ def _build_multi_city_filters(params: MultiCitySearchParams) -> FlightSearchFilt
     )
 
 
+def _separate_tickets_summary(
+    filters: FlightSearchFilters,
+    combos: list[Any] | None,
+    params: MultiCitySearchParams,
+    currency: str | None,
+    client: SearchFlights,
+) -> dict[str, Any]:
+    """Price each leg as a one-way ticket and compare the sum with one ticket.
+
+    Best effort: a failure is reported inside the summary and never fails the
+    multi-city search itself.
+    """
+    try:
+        separate = search_separate_tickets(
+            filters, currency=currency, language=params.language, country=params.country
+        )
+    except Exception as e:  # noqa: BLE001 — optional enrichment
+        return {"error": _search_error_message(e, prefix="Separate-ticket pricing failed")}
+    summary = compare_with_one_ticket(separate, combos)
+    summary["legs"] = [
+        None
+        if leg is None
+        else _serialize_flight_result(
+            leg,
+            booking_url=client.build_flight_booking_url(
+                leg,
+                currency=params.currency,
+                language=params.language,
+                country=params.country,
+                seat_type=filters.seat_type,
+                passenger_info=filters.passenger_info,
+                trip_type=TripType.ONE_WAY,
+            ),
+        )
+        for leg in separate.legs
+    ]
+    return summary
+
+
 def _execute_multi_city_search(params: MultiCitySearchParams) -> dict[str, Any]:
     """Execute a multi-city search and return formatted results."""
     try:
@@ -996,6 +1037,10 @@ def _execute_multi_city_search(params: MultiCitySearchParams) -> dict[str, Any]:
             "search_url": search_url,
             "pages_loaded": multi_city_page_count(len(params.legs), params.top_n),
         }
+        if params.compare_separate_tickets:
+            response["separate_tickets"] = _separate_tickets_summary(
+                filters, combos, params, currency, search_client
+            )
         if not combos:
             response.update(flights=[], count=0)
             if search_client.sparse_passenger_mix:
@@ -1796,6 +1841,16 @@ def search_multi_city(
             le=10,
         ),
     ] = 3,
+    compare_separate_tickets: Annotated[
+        bool,
+        Field(
+            description=(
+                "Also price each leg as its own one-way ticket (fast, no browser) and "
+                "return `separate_tickets`: the cheapest fare per leg, their total, and "
+                "how it compares with the cheapest one-ticket trip."
+            )
+        ),
+    ] = True,
 ) -> dict[str, Any]:
     """Search multi-city and open-jaw trips, priced as one ticket like Google Flights.
 
@@ -1807,6 +1862,12 @@ def search_multi_city(
     Each result is one complete trip with `price` for the whole itinerary,
     every flight leg in order, and a `booking_url` that opens that exact trip on
     Google Flights. `search_url` opens the multi-city board itself.
+
+    `separate_tickets` (on by default) prices the same legs as one-way tickets:
+    `separate_total`, `one_ticket_total`, `difference` (negative means separate
+    tickets are cheaper), `cheaper`, each leg's cheapest flight with its own
+    `booking_url`, and a `note` on what separate tickets give up. Mention that
+    trade-off when recommending separate tickets.
 
     Runs Google Flights in a headless browser (multi-city results are not
     reachable over plain HTTP), so it is slower than `search_flights` and
@@ -1833,6 +1894,7 @@ def search_multi_city(
         language=language,
         country=country,
         top_n=top_n,
+        compare_separate_tickets=compare_separate_tickets,
     )
     return _execute_multi_city_search(params)
 

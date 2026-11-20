@@ -33,7 +33,8 @@ Configuration (environment variables):
   use the bundled build directly.
 * ``FLI_BROWSER_HEADLESS``: ``0`` to show the browser window (debugging).
 * ``FLI_BROWSER_PAGES``: maximum concurrent page loads.
-* ``FLI_BROWSER_TIMEOUT``: seconds to wait for the results RPC per page.
+* ``FLI_BROWSER_TIMEOUT``: seconds to wait for the results RPC per page
+  (default 20; it normally arrives within 1-3 seconds).
 
 Requires the optional ``browser`` extra: ``pip install 'flights[browser]'``.
 If Chrome is not installed, also run ``playwright install chromium``.
@@ -99,7 +100,7 @@ class BrowserFetcher:
             headless = os.environ.get("FLI_BROWSER_HEADLESS", "1") not in ("0", "false", "no")
         self.headless = headless
         self.max_pages = max_pages or _env_int("FLI_BROWSER_PAGES", 4)
-        self.timeout = timeout or float(_env_int("FLI_BROWSER_TIMEOUT", 30))
+        self.timeout = timeout or float(_env_int("FLI_BROWSER_TIMEOUT", 20))
 
         self._thread_lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -239,7 +240,7 @@ class BrowserFetcher:
                 logger.debug("browser fetch attempt %d/%d failed: %s", attempt + 1, attempts, exc)
         raise SearchTimeoutError(
             f"Google Flights did not return results in the browser after {attempts} "
-            f"attempts ({type(last).__name__}: {last})"
+            f"attempts ({type(last).__name__}: {last}). Page: {url}"
         ) from last
 
 

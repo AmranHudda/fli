@@ -146,6 +146,19 @@ Consequences to keep in mind when changing search code:
   reach it: `tests/conftest.py` replaces `fetch_shopping_body` with a refusal
   outside `live` tests. Expansion costs `1 + n + ... + n^(k-1)` pages
   (`multi_city_page_count`), refused above `MAX_MULTI_CITY_PAGES` (60).
+  Google refuses a share of these signed requests with error 13, in clusters
+  (measured 2026-11-20: one to three of six pinned boards per run; the same
+  board loads moments later). `_fetch_via_browser` retries error 13
+  (`MULTI_CITY_ATTEMPTS`, `MULTI_CITY_RETRY_BACKOFF`, like Explore) and raises
+  `SearchRejectedError(retryable=True)` when every attempt is refused. In
+  `_expand_multi_leg`, a multi-city candidate whose next board stays refused is
+  dropped with one warning; the search raises only if every candidate fails.
+- `fli/search/separate.py` prices a multi-city trip as separate one-way tickets
+  (one HTTP one-way search per leg, in parallel, cheapest priced fare each) and
+  `compare_with_one_ticket` summarises it against the cheapest one-ticket combo.
+  `fli multi --compare-separate` and `search_multi_city`
+  (`compare_separate_tickets`, default true) report it; a failure there is
+  reported inside the summary and never fails the multi-city search.
 - A round-trip or multi-city combination's price is the **last** segment's
   price (`combo_price` / `combo_price_segment` in `fli/search/flights.py`): the
   first board quotes the cheapest total each outbound can reach, the pinned
@@ -265,6 +278,7 @@ headless browser (see "Search transport"), so it is slower than
 - `legs` - Ordered list of `{origin, destination, departure_date}` (2-6)
 - `top_n` - Options per leg expanded into the next (default 3, 1-10); a k-leg
   trip loads `1 + n + ... + n^(k-1)` pages, refused above 60
+- `compare_separate_tickets` - Also price each leg as a one-way (default true)
 - `cabin_class`, `max_stops`, `sort_by`, `departure_window`, `airlines`,
   `exclude_airlines`, `alliance`, `exclude_alliance`, `min_layover`,
   `max_layover`, passenger counts, `currency` / `language` / `country` - Same
@@ -273,7 +287,10 @@ headless browser (see "Search transport"), so it is slower than
 **Response:** `flights[]`, each a whole trip with `price` (the trip total),
 every leg in order and a `booking_url` deep link (`tfs` field 19 = 3) that
 opens that exact itinerary's booking page. `search_url` opens the multi-city
-board; `pages_loaded` reports the browser cost.
+board; `pages_loaded` reports the browser cost. `separate_tickets` carries
+`separate_total`, `one_ticket_total`, `difference` (negative = separate is
+cheaper), `cheaper`, per-leg cheapest flights with one-way `booking_url`s, and
+a `note` on what separate tickets give up (or `error` if pricing failed).
 
 ### `search_dates`
 Find cheapest travel dates within a range.
