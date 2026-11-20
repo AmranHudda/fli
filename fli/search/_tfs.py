@@ -23,9 +23,11 @@ neither encoded nor filtered after the fact is reported by
 :func:`unsupported_filters` so the caller can warn rather than silently
 return results that ignore it.
 
-Multi-city is out of reach here entirely: the page inlines no rows for it,
+Multi-city is out of reach for plain HTTP: the page inlines no rows for it,
 so :func:`build_tfs` refuses those searches rather than returning the first
-leg's one-way board.
+leg's one-way board. :mod:`fli.search._browser` serves them instead, by
+loading the same URL in a real browser and reading the RPC the page makes;
+it asks for the multi-city encoding with ``allow_multi_city=True``.
 """
 
 from __future__ import annotations
@@ -37,7 +39,13 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from fli.models.google_flights.base import TripType
-from fli.search._proto import LegSpec, encode_tfs_payload, encode_tfs_segment, passenger_codes
+from fli.search._proto import (
+    TRIP_CODE_MULTI_CITY,
+    LegSpec,
+    encode_tfs_payload,
+    encode_tfs_segment,
+    passenger_codes,
+)
 from fli.search.exceptions import SearchUnsupportedError
 
 if TYPE_CHECKING:
@@ -98,7 +106,12 @@ def _legs_of(flight: FlightResult) -> list[LegSpec]:
     ]
 
 
-def build_tfs(filters: Any, *, travel_dates: list[str] | None = None) -> str:
+def build_tfs(
+    filters: Any,
+    *,
+    travel_dates: list[str] | None = None,
+    allow_multi_city: bool = False,
+) -> str:
     """Build the ``tfs`` URL parameter for ``filters``.
 
     Args:
@@ -108,13 +121,16 @@ def build_tfs(filters: Any, *, travel_dates: list[str] | None = None) -> str:
         travel_dates: Optional per-segment date overrides, used by the date
             sweep to reprice one segment set across a range without
             deep-copying the whole filter object per day.
+        allow_multi_city: Encode a multi-city trip (field 19 = 3) instead of
+            refusing it. Only the browser transport sets this: the page
+            renders a multi-city board but carries none of its rows.
 
     Returns:
         The base64url ``tfs`` value, unpadded, as Google's own URLs carry it.
 
     Raises:
-        SearchUnsupportedError: For multi-city trips, which this transport
-            cannot serve at all.
+        SearchUnsupportedError: For multi-city trips unless
+            ``allow_multi_city`` is set.
 
     """
     # Field 19 is the trip type. Multi-city is 3, but sending 2 (one-way)
@@ -122,7 +138,8 @@ def build_tfs(filters: Any, *, travel_dates: list[str] | None = None) -> str:
     # leg's one-way board, which decodes cleanly into wrong results; sending
     # 3 renders the right board in a browser but inlines no flight rows —
     # multi-city is fetched client-side through the RPC gated since 2026-08.
-    if filters.trip_type == TripType.MULTI_CITY:
+    is_multi_city = filters.trip_type == TripType.MULTI_CITY
+    if is_multi_city and not allow_multi_city:
         raise SearchUnsupportedError(
             "Multi-city search is not available through the search-page transport: "
             "Google loads those results client-side through the gated RPC, so the "
@@ -161,6 +178,7 @@ def build_tfs(filters: Any, *, travel_dates: list[str] | None = None) -> str:
         is_one_way=filters.trip_type == TripType.ONE_WAY,
         passengers=passengers,
         seat=filters.seat_type.value,
+        trip_code=TRIP_CODE_MULTI_CITY if is_multi_city else None,
     )
 
 

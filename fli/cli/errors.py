@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import typer
+from rich.markup import escape
 
 from fli.cli.console import console
 from fli.core.errors import classify_error
@@ -93,8 +94,10 @@ def report_cli_error(
     log_path = _write_log(exc, command=command)
     message = _friendly_message(exc)
 
-    console.print(f"[red]Error:[/red] {message}")
-    console.print(f"[dim]Full traceback written to {log_path}[/dim]")
+    # Escaped: messages carry literal brackets (e.g. pip's `flights[browser]`
+    # extra), which Rich would otherwise eat as markup tags.
+    console.print(f"[red]Error:[/red] {escape(message)}")
+    console.print(f"[dim]Full traceback written to {escape(str(log_path))}[/dim]")
 
     # Still log at debug for anyone who wired up python logging.
     _logger.debug("CLI error", exc_info=exc)

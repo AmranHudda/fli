@@ -287,14 +287,21 @@ def test_display_multi_city_three_legs():
 
 
 def test_display_round_trip_price_asymmetric():
-    """When leg prices differ, total should be the outbound price, not the sum."""
+    """The total is the return board's quote, not the outbound's and not the sum.
+
+    The outbound board lists the cheapest round trip each outbound can be part
+    of; the return board, fetched with that outbound pinned, quotes the exact
+    total for each return (live JFK-LAX 2026-11-20: one outbound at $458 with
+    returns at $458, $532, $562 and $935).
+    """
     outbound = _make_flight_result(price=400.0)
-    return_flight = _make_flight_result(price=350.0)
+    return_flight = _make_flight_result(price=450.0)
 
     output = _capture_display([(outbound, return_flight)])
 
-    assert "$400.00" in output
-    assert "$750.00" not in output
+    assert "$450.00" in output
+    assert "$400.00" not in output
+    assert "$850.00" not in output
 
 
 def test_display_flight_results_shows_booking_url_footer():

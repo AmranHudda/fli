@@ -61,6 +61,7 @@ from fli.mcp.server import (
     _execute_flight_search,
 )
 from fli.search.exceptions import (
+    BrowserUnavailableError,
     SearchCertificateError,
     SearchClientError,
     SearchConnectionError,
@@ -111,6 +112,7 @@ _INSTANCES: dict[type, BaseException] = {
     SearchHTTPError: SearchHTTPError("bad response", status_code=500),
     SearchRejectedError: SearchRejectedError(13),
     SearchUnsupportedError: SearchUnsupportedError("multi-city"),
+    BrowserUnavailableError: BrowserUnavailableError("playwright missing"),
     SearchParseError: SearchParseError("no ds:1 payload"),
     ParseError: ParseError("unknown airport code 'ZZZ'"),
     ValueError: ValueError("bad date range"),

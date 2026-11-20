@@ -39,6 +39,31 @@ def pin_today(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_browser_outside_live_tests(request, monkeypatch):
+    """Keep offline tests from launching a real browser.
+
+    Multi-city searches go through ``fli.search._browser``, which starts
+    Chrome and loads Google Flights. Any test that reaches it without
+    mocking would quietly turn into a slow live test (and pass or fail on
+    Google's mood), so outside ``live``-marked tests the entry point raises
+    instead. Tests that exercise the multi-city path patch
+    ``fli.search._browser.fetch_shopping_body`` themselves; that patch is
+    applied after this one and wins.
+    """
+    if request.node.get_closest_marker("live") is not None:
+        return
+
+    def _refuse(url: str) -> str:
+        raise AssertionError(
+            "An offline test reached the browser transport. Patch "
+            "fli.search._browser.fetch_shopping_body, or mark the test live. "
+            f"URL: {url}"
+        )
+
+    monkeypatch.setattr("fli.search._browser.fetch_shopping_body", _refuse)
+
+
+@pytest.fixture(autouse=True)
 def _scrub_ca_bundle_env(monkeypatch):
     """Clear FLI_CA_BUNDLE / CURL_CA_BUNDLE / REQUESTS_CA_BUNDLE for every test.
 

@@ -24,6 +24,7 @@ from fli.models import (
     SeatType,
 )
 from fli.models.google_flights.base import SortBy, TripType
+from fli.search import _browser
 from fli.search._concurrency import parallel_map
 from fli.search._decoders import (
     _try_parse_booking_row,  # noqa: F401 — back-compat re-export for tests
@@ -39,7 +40,7 @@ from fli.search._tfs import (
 )
 from fli.search._urls import with_locale_params
 from fli.search._urls import with_locale_params as _with_locale_params  # noqa: F401
-from fli.search._wire import iter_wrb_chunks
+from fli.search._wire import iter_wrb_chunks, parse_first_wrb_payload
 from fli.search.client import get_client
 from fli.search.exceptions import SearchParseError
 
@@ -79,6 +80,21 @@ def _has_children_or_infants(passenger_info: PassengerInfo) -> bool:
     )
 
 
+# Multi-city boards load in a browser at roughly 2-6 seconds each, and the
+# expansion tree grows as top_n ** depth. Past this many pages a search is
+# minutes long and hammers Google, so it is refused with a clear message.
+MAX_MULTI_CITY_PAGES = 60
+
+
+def multi_city_page_count(num_segments: int, top_n: int) -> int:
+    """Pages a multi-city search loads: one board per level of the expansion tree.
+
+    The first board, then ``top_n`` boards for the second direction, then
+    ``top_n`` for each of those, and so on: ``1 + n + ... + n^(k-1)``.
+    """
+    return sum(top_n**level for level in range(max(1, num_segments)))
+
+
 class _RowCountTracker:
     """Notes whether any fetched page decoded to zero rows before filtering.
 
@@ -112,6 +128,25 @@ class _RowCountTracker:
             return self._any_zero_rows
 
 
+def _infer_trip_type(results: list[FlightResult]) -> TripType:
+    """Guess a deep link's trip type from the itinerary's own airports.
+
+    Two directions are a round trip only when the second retraces the first
+    (A to B, then B to A). An open jaw (A to B, then C to A) is a two-leg
+    multi-city trip, and encoding it as a round trip opens the wrong board.
+    """
+    if len(results) == 1:
+        return TripType.ONE_WAY
+    if len(results) == 2 and all(r.legs for r in results):
+        out_origin = results[0].legs[0].departure_airport
+        out_dest = results[0].legs[-1].arrival_airport
+        back_origin = results[1].legs[0].departure_airport
+        back_dest = results[1].legs[-1].arrival_airport
+        if out_origin == back_dest and out_dest == back_origin:
+            return TripType.ROUND_TRIP
+    return TripType.MULTI_CITY
+
+
 def _sort_key(sort_by: SortBy) -> Callable[[FlightResult], Any]:
     """Return the result-ordering key for ``sort_by``.
 
@@ -129,6 +164,48 @@ def _sort_key(sort_by: SortBy) -> Callable[[FlightResult], Any]:
     if sort_by == SortBy.ARRIVAL_TIME:
         return lambda f: f.legs[-1].arrival_datetime
     return lambda f: 0
+
+
+def combo_price_segment(combo: tuple[FlightResult, ...]) -> FlightResult:
+    """Return the segment whose price is the whole combination's price.
+
+    See :func:`combo_price` for why that is the last segment. Callers that
+    also show the price's currency or ticket flags (self transfer, mixed
+    cabin) should read them from this same segment.
+    """
+    if combo[-1].price is not None or combo[0].price is None:
+        return combo[-1]
+    return combo[0]
+
+
+def combo_price(combo: tuple[FlightResult, ...]) -> float | None:
+    """Return the total price of a round-trip or multi-city combination.
+
+    Google prices a multi-leg trip as one ticket, and each board quotes the
+    whole trip: the first board's price is the cheapest total *available*
+    with that first flight, and the board for the last direction, fetched
+    with every earlier flight pinned, quotes the total for exactly the
+    chosen combination. So the last segment's price is the trip's price.
+    Measured 2026-11-20 on JFK-LAX: one outbound listed at $458 combined
+    with returns priced $458, $532, $562 and $935.
+
+    Falls back to the first segment's price when the last has none (Google
+    sometimes omits it on premium-cabin return rows, issue #165).
+    """
+    return combo_price_segment(combo).price
+
+
+def _combo_sort_key(sort_by: SortBy) -> Callable[[tuple[FlightResult, ...]], Any] | None:
+    """Return the ordering key for multi-leg combinations, or ``None`` to keep order."""
+    if sort_by == SortBy.CHEAPEST:
+        return lambda c: (combo_price(c) is None, combo_price(c) or 0)
+    if sort_by == SortBy.DURATION:
+        return lambda c: sum(segment.duration or 0 for segment in c)
+    if sort_by == SortBy.DEPARTURE_TIME:
+        return lambda c: c[0].legs[0].departure_datetime
+    if sort_by == SortBy.ARRIVAL_TIME:
+        return lambda c: c[-1].legs[-1].arrival_datetime
+    return None
 
 
 class SearchFlights:
@@ -263,6 +340,14 @@ class SearchFlights:
                 "round-trip search expands into return-flight combinations — cost is "
                 "1 + top_n page fetches, hence the cap."
             )
+        if filters.trip_type == TripType.MULTI_CITY:
+            pages = multi_city_page_count(len(filters.flight_segments), top_n)
+            if pages > MAX_MULTI_CITY_PAGES:
+                raise ValueError(
+                    f"A {len(filters.flight_segments)}-leg search with top_n={top_n} would "
+                    f"load {pages} pages in the browser (limit {MAX_MULTI_CITY_PAGES}). "
+                    "Lower top_n, or search fewer legs at a time."
+                )
         # Per-search, lock-guarded — never instance state, which the round
         # trip's parallel expansion workers (below) would trample mid-flight.
         tracker = _RowCountTracker()
@@ -290,6 +375,10 @@ class SearchFlights:
         )
         if not combos:
             self._warn_if_sparse_passenger_mix(filters, tracker)
+            return combos
+        key = _combo_sort_key(filters.sort_by)
+        if key is not None and all(isinstance(combo, tuple) for combo in combos):
+            combos.sort(key=key)
         return combos
 
     def _warn_if_sparse_passenger_mix(
@@ -347,13 +436,16 @@ class SearchFlights:
                 ", ".join(dropped),
             )
 
-        url = page_url(build_tfs(filters), currency, language, country)
-        inner = fetch_payload(self.client, url)
-        if inner is None:
-            raise SearchParseError(
-                "Search page carried no ds:1 payload — Google may have changed "
-                "the page shape, or served a consent/blocked page instead."
-            )
+        if filters.trip_type == TripType.MULTI_CITY:
+            inner = self._fetch_via_browser(filters, currency, language, country)
+        else:
+            url = page_url(build_tfs(filters), currency, language, country)
+            inner = fetch_payload(self.client, url)
+            if inner is None:
+                raise SearchParseError(
+                    "Search page carried no ds:1 payload — Google may have changed "
+                    "the page shape, or served a consent/blocked page instead."
+                )
 
         if capture_session:
             self._capture_session_id(inner)
@@ -401,6 +493,31 @@ class SearchFlights:
         flights = apply_client_side_filters(flights, filters)
         flights.sort(key=_sort_key(filters.sort_by))
         return flights or None
+
+    @staticmethod
+    def _fetch_via_browser(
+        filters: FlightSearchFilters,
+        currency: str | None,
+        language: str | None,
+        country: str | None,
+    ) -> Any:
+        """Fetch one multi-city board through the browser transport.
+
+        The page renders the board but loads its rows through the gated
+        ``GetShoppingResults`` RPC, so a real browser loads the page and
+        :mod:`fli.search._browser` returns that RPC's body. The body is the
+        classic ``wrb.fr`` framing, and its first chunk has the same shape
+        as the page's inline ``ds:1`` payload: rows at ``[2]`` and ``[3]``.
+        """
+        url = page_url(build_tfs(filters, allow_multi_city=True), currency, language, country)
+        body = _browser.fetch_shopping_body(url)
+        inner = parse_first_wrb_payload(body)
+        if inner is None:
+            raise SearchParseError(
+                "The multi-city results request returned no payload — Google may "
+                "have changed the response shape."
+            )
+        return inner
 
     def get_booking_options(
         self,
@@ -543,6 +660,7 @@ class SearchFlights:
         country: str | None = None,
         seat_type: SeatType = SeatType.ECONOMY,
         passenger_info: PassengerInfo | None = None,
+        trip_type: TripType | None = None,
     ) -> str:
         """Build a Google Flights deep-link URL for a specific itinerary.
 
@@ -569,12 +687,21 @@ class SearchFlights:
                 (field 8, one entry per traveller). ``None`` defaults to a
                 single adult, matching this method's output before this
                 parameter existed.
+            trip_type: The search's trip type. When omitted it is inferred:
+                one direction is one-way, two directions that retrace each
+                other are a round trip, and anything else (three or more
+                directions, or an open jaw) is multi-city.
 
         Returns:
             A ``https://www.google.com/travel/flights/booking?tfs=…`` URL.
 
         """
-        from fli.search._proto import LegSpec, build_tfs_token, passenger_codes
+        from fli.search._proto import (
+            TRIP_CODE_MULTI_CITY,
+            LegSpec,
+            build_tfs_token,
+            passenger_codes,
+        )
 
         def _iata(airport: object) -> str:
             # Handle both Airport enum (has .name) and plain strings.
@@ -584,6 +711,9 @@ class SearchFlights:
         is_one_way = len(results) == 1
 
         try:
+            if trip_type is None:
+                trip_type = _infer_trip_type(results)
+            trip_code = TRIP_CODE_MULTI_CITY if trip_type == TripType.MULTI_CITY else None
             segments: list[list[LegSpec]] = []
             for result in results:
                 seg_legs = [
@@ -602,6 +732,7 @@ class SearchFlights:
                 is_one_way=is_one_way,
                 passengers=passenger_codes(passenger_info),
                 seat=seat_type.value,
+                trip_code=trip_code,
             )
             url = f"https://www.google.com/travel/flights/booking?tfs={tfs}"
         except Exception:

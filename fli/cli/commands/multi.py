@@ -1,15 +1,25 @@
 """Multi-city flight search CLI command."""
 
 import re
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 from pydantic import ValidationError
 
-from fli.cli.errors import report_cli_error
-from fli.cli.utils import display_flight_results, validate_time_range
+from fli.cli.enums import OutputFormat
+from fli.cli.errors import json_error_payload, report_cli_error
+from fli.cli.utils import (
+    build_json_error_response,
+    build_json_success_response,
+    display_flight_results,
+    emit_json,
+    serialize_flight_result,
+    validate_currency,
+    validate_time_range,
+)
 from fli.core import (
     build_multi_city_segments,
+    classify_error,
     format_validation_error,
     normalize_date,
     parse_airlines,
@@ -25,6 +35,7 @@ from fli.models import (
     TimeRestrictions,
 )
 from fli.search import SearchClientError, SearchFlights
+from fli.search._tfs import build_tfs, page_url
 
 LEG_PATTERN = re.compile(r"^([A-Za-z]{3}),([A-Za-z]{3}),(\d{4}-\d{1,2}-\d{1,2})$")
 
@@ -130,10 +141,43 @@ def multi(
             min=0,
         ),
     ] = 0,
+    top_n: Annotated[
+        int,
+        typer.Option(
+            "--top-n",
+            "-n",
+            help=(
+                "Options per leg to expand into the next leg. A trip with k legs loads "
+                "1 + n + ... + n^(k-1) pages in a browser, so keep it small for 3+ legs."
+            ),
+            min=1,
+            max=10,
+        ),
+    ] = 3,
+    output_format: Annotated[
+        OutputFormat,
+        typer.Option(
+            "--format",
+            help="Output format: text or json",
+            case_sensitive=False,
+        ),
+    ] = OutputFormat.TEXT,
+    currency: Annotated[
+        str,
+        typer.Option(
+            "--currency",
+            callback=validate_currency,
+            help="Currency code (USD, EUR, GBP, JPY...). Passed to Google as `curr=`.",
+        ),
+    ] = "USD",
 ):
     """Search for multi-city flights with multiple legs.
 
     Each leg specifies an origin, destination, and date. At least two legs are required.
+    Prices are for the whole trip on one ticket, as Google Flights quotes multi-city.
+
+    Multi-city results load in a headless browser, so this command needs the
+    optional browser extra: pip install 'flights[browser]'.
 
     Example:
         fli multi --leg SEA,HKG,2026-12-26 --leg PEK,SEA,2027-01-02
@@ -142,6 +186,31 @@ def multi(
         fli multi -l SEA,NRT,2026-12-26 -l HKG,SEA,2027-01-05 --passengers 2 --children 1
 
     """
+    query: dict[str, Any] = {
+        "legs": legs,
+        "cabin_class": cabin_class.upper(),
+        "max_stops": max_stops.upper(),
+        "sort_by": sort_by.upper(),
+        "top_n": top_n,
+        "currency": currency,
+    }
+    json_mode = output_format == OutputFormat.JSON
+
+    def fail(exc: Exception, message: str) -> typer.Exit:
+        """Report an input or search error in the requested format."""
+        if json_mode:
+            emit_json(
+                build_json_error_response(
+                    search_type="flights",
+                    message=message,
+                    query=query,
+                    **classify_error(exc).as_fields(),
+                )
+            )
+        else:
+            typer.echo(f"Error: {message}")
+        return typer.Exit(1)
+
     try:
         if len(legs) < 2:
             typer.echo("Error: multi-city search requires at least 2 legs")
@@ -155,6 +224,10 @@ def multi(
             origin_airport = resolve_airport(origin)
             destination_airport = resolve_airport(destination)
             parsed_legs.append((origin_airport, destination_airport, date))
+        query["legs"] = [
+            {"origin": o.name.lstrip("_"), "destination": d.name.lstrip("_"), "departure_date": dt}
+            for o, d, dt in parsed_legs
+        ]
 
         # Parse shared filter parameters
         seat_type = parse_cabin_class(cabin_class)
@@ -192,26 +265,83 @@ def multi(
             sort_by=sort,
         )
 
-        # Perform search
+        # The same multi-city board on Google Flights, for opening in a browser.
+        search_url = page_url(build_tfs(filters, allow_multi_city=True), currency)
+
         search_client = SearchFlights()
-        results = search_client.search(filters)
+        results = search_client.search(filters, top_n=top_n, currency=currency)
 
         if not results:
+            if json_mode:
+                emit_json(
+                    build_json_success_response(
+                        search_type="flights",
+                        trip_type=trip_type,
+                        query=query,
+                        results_key="flights",
+                        results=[],
+                        booking_url=search_url,
+                    )
+                )
+                return
             typer.echo("No flights found.")
             raise typer.Exit(1)
 
-        display_flight_results(results, trip_type=trip_type)
+        booking_urls = [
+            search_client.build_flight_booking_url(
+                result,
+                currency=currency,
+                seat_type=seat_type,
+                passenger_info=filters.passenger_info,
+                trip_type=trip_type,
+            )
+            for result in results
+        ]
+
+        if json_mode:
+            emit_json(
+                build_json_success_response(
+                    search_type="flights",
+                    trip_type=trip_type,
+                    query=query,
+                    results_key="flights",
+                    results=[
+                        serialize_flight_result(result, default_currency=currency, booking_url=url)
+                        for result, url in zip(results, booking_urls, strict=False)
+                    ],
+                    booking_url=search_url,
+                )
+            )
+            return
+
+        display_flight_results(
+            results,
+            trip_type=trip_type,
+            default_currency=currency,
+            booking_url=search_url,
+            booking_urls=booking_urls,
+        )
 
     except ParseError as e:
-        typer.echo(f"Error: {str(e)}")
-        raise typer.Exit(1) from e
+        raise fail(e, str(e)) from e
     except ValidationError as e:
-        typer.echo(f"Error: {format_validation_error(e)}")
-        raise typer.Exit(1) from e
+        raise fail(e, format_validation_error(e)) from e
     except (AttributeError, ValueError) as e:
-        typer.echo(f"Error: {str(e)}")
-        raise typer.Exit(1) from e
+        raise fail(e, str(e)) from e
     except SearchClientError as e:
+        if json_mode:
+            info = json_error_payload(e, command="multi")
+            payload = build_json_error_response(
+                search_type="flights",
+                message=info.message,
+                error_type=info.error_type,
+                retryable=info.retryable,
+                http_status=info.http_status,
+                query=query,
+            )
+            payload["error"]["log_path"] = str(info.log_path)
+            emit_json(payload)
+            raise typer.Exit(1) from e
         raise report_cli_error(e, command="multi") from e
     except (typer.Exit, typer.Abort):
         # click.exceptions.Exit/Abort are RuntimeError subclasses, so without

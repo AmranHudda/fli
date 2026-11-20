@@ -1,5 +1,6 @@
 from .dates import DatePrice, SearchDates
 from .exceptions import (
+    BrowserUnavailableError,
     SearchCertificateError,
     SearchClientError,
     SearchConnectionError,
@@ -25,4 +26,5 @@ __all__ = [
     "SearchParseError",
     "SearchRejectedError",
     "SearchUnsupportedError",
+    "BrowserUnavailableError",
 ]

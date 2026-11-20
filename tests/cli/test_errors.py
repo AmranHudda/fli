@@ -155,8 +155,15 @@ def test_search_command_handles_timeout_cleanly(runner, monkeypatch, tmp_path):
     assert len(log_files) >= 1
 
 
-def test_multi_command_reports_unsupported(runner, tmp_path):
-    """Multi-city has no search-page transport — say so instead of pricing one leg."""
+def test_multi_command_reports_missing_browser(runner, monkeypatch):
+    """Without the browser extra, say how to install it instead of crashing."""
+    from fli.search._browser import INSTALL_HINT
+    from fli.search.exceptions import BrowserUnavailableError
+
+    def _missing(url):  # noqa: ANN001
+        raise BrowserUnavailableError(INSTALL_HINT)
+
+    monkeypatch.setattr("fli.search._browser.fetch_shopping_body", _missing)
     result = runner.invoke(
         app,
         [
@@ -171,8 +178,31 @@ def test_multi_command_reports_unsupported(runner, tmp_path):
     )
 
     assert result.exit_code == 1
-    assert "Multi-city search is not available" in result.output
+    assert "flights[browser]" in "".join(result.output.split())
     assert "Traceback (most recent call last)" not in result.output
+
+
+def test_multi_command_json_reports_missing_browser(runner, monkeypatch):
+    """JSON mode carries the same failure as a typed, non-retryable error."""
+    import json
+
+    from fli.search._browser import INSTALL_HINT
+    from fli.search.exceptions import BrowserUnavailableError
+
+    def _missing(url):  # noqa: ANN001
+        raise BrowserUnavailableError(INSTALL_HINT)
+
+    monkeypatch.setattr("fli.search._browser.fetch_shopping_body", _missing)
+    result = runner.invoke(
+        app,
+        ["multi", "-l", "SEA,NRT,2026-12-26", "-l", "NRT,SEA,2026-12-30", "--format", "json"],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["success"] is False
+    assert payload["error"]["type"] == "unsupported_error"
+    assert payload["error"]["retryable"] is False
 
 
 @pytest.mark.parametrize(

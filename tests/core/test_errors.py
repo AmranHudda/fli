@@ -24,6 +24,7 @@ from pydantic import BaseModel, ValidationError
 from fli.core.errors import ErrorClassification, classify_error
 from fli.core.parsers import ParseError
 from fli.search.exceptions import (
+    BrowserUnavailableError,
     SearchCertificateError,
     SearchClientError,
     SearchConnectionError,
@@ -66,6 +67,12 @@ _EXPECTED: dict[type, tuple[type[BaseException], tuple[str, bool]]] = {
     SearchHTTPError: (SearchHTTPError("bad response", status_code=500), ("http_error", True)),
     SearchRejectedError: (SearchRejectedError(13), ("rejected_error", False)),
     SearchUnsupportedError: (SearchUnsupportedError("multi-city"), ("unsupported_error", False)),
+    # Missing optional dependency for the multi-city browser transport: the
+    # fix is an install, never a retry.
+    BrowserUnavailableError: (
+        BrowserUnavailableError("playwright missing"),
+        ("unsupported_error", False),
+    ),
     SearchParseError: (SearchParseError("no ds:1 payload"), ("parse_error", False)),
 }
 

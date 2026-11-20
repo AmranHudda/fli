@@ -136,6 +136,17 @@ class SearchUnsupportedError(SearchClientError):
     """
 
 
+class BrowserUnavailableError(SearchUnsupportedError):
+    """The browser transport cannot run: Playwright or a browser is missing.
+
+    Multi-city boards are only reachable by loading the search page in a
+    real browser (see :mod:`fli.search._browser`). A subclass of
+    :class:`SearchUnsupportedError` because the remedy is the same kind:
+    nothing about the request is wrong, and retrying will not help until
+    the optional ``browser`` extra is installed.
+    """
+
+
 class SearchParseError(SearchClientError):
     """A successful HTTP response could not be parsed into flights.
 

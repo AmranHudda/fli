@@ -45,6 +45,7 @@ from fli.models import (
     ExploreRegion,
     ExploreSearchFilters,
     FlightSearchFilters,
+    FlightSegment,
     PassengerInfo,
     PriceLimit,
     TripType,
@@ -52,9 +53,15 @@ from fli.models import (
 )
 from fli.models.google_flights.explore import KG_MID_PREFIXES
 from fli.search import SearchDates, SearchExplore, SearchFlights
+from fli.search._tfs import build_tfs, page_url
 from fli.search.dates import MAX_DATES_PER_SEARCH
 from fli.search.exceptions import SearchParseError
-from fli.search.flights import SPARSE_PASSENGER_MIX_WARNING
+from fli.search.flights import (
+    MAX_MULTI_CITY_PAGES,
+    SPARSE_PASSENGER_MIX_WARNING,
+    combo_price_segment,
+    multi_city_page_count,
+)
 
 
 class FlightSearchConfig(BaseSettings):
@@ -239,6 +246,42 @@ class FlightSearchParams(BaseModel):
             "one-way searches."
         ),
     )
+
+
+class MultiCityLeg(BaseModel):
+    """One direction of a multi-city trip."""
+
+    origin: str = Field(
+        description="Departure airport IATA code(s), comma-separated for multiple (e.g. 'BOS')"
+    )
+    destination: str = Field(
+        description="Arrival airport IATA code(s), comma-separated for multiple (e.g. 'FCO')"
+    )
+    departure_date: str = Field(description="Travel date for this leg in YYYY-MM-DD format")
+
+
+class MultiCitySearchParams(BaseModel):
+    """Parameters for a multi-city (or open-jaw) search priced as one ticket."""
+
+    legs: list[MultiCityLeg] = Field(min_length=2, max_length=6)
+    departure_window: str | None = None
+    airlines: list[str] | None = None
+    exclude_airlines: list[str] | None = None
+    alliance: list[str] | None = None
+    exclude_alliance: list[str] | None = None
+    cabin_class: str = CONFIG.default_cabin_class
+    max_stops: str = "ANY"
+    sort_by: str = CONFIG.default_sort_by
+    passengers: int = Field(CONFIG.default_passengers, ge=1)
+    children: int = Field(0, ge=0)
+    infants_in_seat: int = Field(0, ge=0)
+    infants_on_lap: int = Field(0, ge=0)
+    min_layover: int | None = Field(None, ge=1)
+    max_layover: int | None = Field(None, ge=1)
+    currency: str | None = None
+    language: str | None = None
+    country: str | None = None
+    top_n: int = Field(3, ge=1, le=10)
 
 
 class DateSearchParams(BaseModel):
@@ -616,12 +659,16 @@ def _serialize_flight_result(
 
     segments = list(flight)
 
+    # The board for the last direction quotes the whole combination; the
+    # outbound's own price is only the cheapest total it can be part of
+    # (see fli.search.flights.combo_price).
+    price_segment = combo_price_segment(flight)
+
     if len(segments) == 2 and is_round_trip:
-        # Google Flights returns the full round-trip price on the outbound leg
         outbound, return_flight = segments
         out = {
-            "price": outbound.price,
-            "currency": outbound.currency or CONFIG.default_currency,
+            "price": price_segment.price,
+            "currency": price_segment.currency or CONFIG.default_currency,
             "legs": [
                 *[_serialize_flight_leg(leg) for leg in outbound.legs],
                 *[_serialize_flight_leg(leg) for leg in return_flight.legs],
@@ -635,9 +682,6 @@ def _serialize_flight_result(
             out["booking_url"] = booking_url
         return out
 
-    # Multi-city (3+ legs) or 2-leg non-round-trip: combined price on the
-    # final leg (matches Google Flights pricing and the CLI display logic).
-    price_segment = segments[-1] if len(segments) > 2 else segments[0]
     out = {
         "price": price_segment.price,
         "currency": price_segment.currency or CONFIG.default_currency,
@@ -857,6 +901,126 @@ def _execute_flight_search(params: FlightSearchParams) -> dict[str, Any]:
             "trip_type": trip_type.name,
             "booking_url": booking_url,
         }
+
+    except ParseError as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "flights": [],
+            **classify_error(e).as_fields(),
+        }
+    except ValidationError as e:
+        return {
+            "success": False,
+            "error": format_validation_error(e),
+            "flights": [],
+            **classify_error(e).as_fields(),
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": _search_error_message(e),
+            "flights": [],
+            **classify_error(e).as_fields(),
+        }
+
+
+def _build_multi_city_filters(params: MultiCitySearchParams) -> FlightSearchFilters:
+    """Translate multi-city request params into search filters."""
+    departure_window = params.departure_window or CONFIG.default_departure_window
+    time_restrictions = build_time_restrictions(departure_window) if departure_window else None
+
+    segments = [
+        FlightSegment(
+            departure_airport=[[airport, 0] for airport in _resolve_airports(leg.origin)],
+            arrival_airport=[[airport, 0] for airport in _resolve_airports(leg.destination)],
+            travel_date=leg.departure_date,
+            time_restrictions=time_restrictions,
+        )
+        for leg in params.legs
+    ]
+
+    layover_restrictions = None
+    if params.min_layover is not None or params.max_layover is not None:
+        from fli.models import LayoverRestrictions
+
+        layover_restrictions = LayoverRestrictions(
+            min_duration=params.min_layover,
+            max_duration=params.max_layover,
+        )
+
+    return FlightSearchFilters(
+        trip_type=TripType.MULTI_CITY,
+        passenger_info=PassengerInfo(
+            adults=params.passengers,
+            children=params.children,
+            infants_in_seat=params.infants_in_seat,
+            infants_on_lap=params.infants_on_lap,
+        ),
+        flight_segments=segments,
+        stops=parse_max_stops(params.max_stops),
+        seat_type=parse_cabin_class(params.cabin_class),
+        airlines=parse_airlines(params.airlines),
+        airlines_exclude=parse_airlines(params.exclude_airlines),
+        alliances=parse_alliances(params.alliance),
+        alliances_exclude=parse_alliances(params.exclude_alliance),
+        layover_restrictions=layover_restrictions,
+        sort_by=parse_sort_by(params.sort_by),
+    )
+
+
+def _execute_multi_city_search(params: MultiCitySearchParams) -> dict[str, Any]:
+    """Execute a multi-city search and return formatted results."""
+    try:
+        filters = _build_multi_city_filters(params)
+        currency = parse_currency(params.currency)
+        search_url = page_url(
+            build_tfs(filters, allow_multi_city=True),
+            currency,
+            params.language,
+            params.country,
+        )
+
+        search_client = SearchFlights()
+        combos = search_client.search(
+            filters,
+            top_n=params.top_n,
+            currency=currency,
+            language=params.language,
+            country=params.country,
+        )
+
+        response: dict[str, Any] = {
+            "success": True,
+            "trip_type": TripType.MULTI_CITY.name,
+            "search_url": search_url,
+            "pages_loaded": multi_city_page_count(len(params.legs), params.top_n),
+        }
+        if not combos:
+            response.update(flights=[], count=0)
+            if search_client.sparse_passenger_mix:
+                response["note"] = SPARSE_PASSENGER_MIX_WARNING
+            return response
+
+        flight_results = [
+            _serialize_flight_result(
+                combo,
+                booking_url=search_client.build_flight_booking_url(
+                    combo,
+                    currency=params.currency,
+                    language=params.language,
+                    country=params.country,
+                    seat_type=filters.seat_type,
+                    passenger_info=filters.passenger_info,
+                    trip_type=TripType.MULTI_CITY,
+                ),
+            )
+            for combo in combos
+        ]
+        if CONFIG.max_results:
+            flight_results = flight_results[: CONFIG.max_results]
+        response.update(flights=flight_results, count=len(flight_results))
+        return response
 
     except ParseError as e:
         return {
@@ -1532,6 +1696,145 @@ def search_flights(
 def _search_flights_from_params(params: FlightSearchParams) -> dict[str, Any]:
     """Entry point for tests that call the tool via a params object."""
     return _execute_flight_search(params)
+
+
+@mcp.tool(
+    annotations={
+        "title": "Search Multi-City Flights",
+        "readOnlyHint": True,
+        "idempotentHint": True,
+    },
+)
+def search_multi_city(
+    legs: Annotated[
+        list[MultiCityLeg],
+        Field(
+            description=(
+                "The trip's legs in order, 2 to 6, each with origin, destination and "
+                "departure_date (YYYY-MM-DD). An open jaw (fly into one city, home from "
+                "another) is two legs, e.g. BOS to FCO then MXP to BOS."
+            ),
+            min_length=2,
+            max_length=6,
+        ),
+    ],
+    cabin_class: Annotated[
+        str,
+        Field(description="Cabin class: ECONOMY, PREMIUM_ECONOMY, BUSINESS, FIRST"),
+    ] = CONFIG.default_cabin_class,
+    max_stops: Annotated[
+        str,
+        Field(description="Maximum stops per leg: ANY, NON_STOP, ONE_STOP, TWO_PLUS_STOPS"),
+    ] = "ANY",
+    sort_by: Annotated[
+        str,
+        Field(description="Sort trips by: CHEAPEST, DURATION, DEPARTURE_TIME, ARRIVAL_TIME"),
+    ] = CONFIG.default_sort_by,
+    departure_window: Annotated[
+        str | None,
+        Field(description="Departure time window for every leg, 'HH-HH' 24h (e.g. '6-20')"),
+    ] = None,
+    airlines: Annotated[
+        list[str] | None,
+        Field(description="Only these airline IATA codes (e.g. ['UA', 'LH'])"),
+    ] = None,
+    exclude_airlines: Annotated[
+        list[str] | None,
+        Field(description="Airline IATA codes to EXCLUDE from results."),
+    ] = None,
+    alliance: Annotated[
+        list[str] | None,
+        Field(description="Restrict to alliances: ONEWORLD, SKYTEAM, STAR_ALLIANCE."),
+    ] = None,
+    exclude_alliance: Annotated[
+        list[str] | None,
+        Field(description="Alliance names to EXCLUDE from results."),
+    ] = None,
+    passengers: Annotated[
+        int | None,
+        Field(description="Number of adult passengers", ge=1),
+    ] = None,
+    children: Annotated[int, Field(description="Number of children (ages 2-11)", ge=0)] = 0,
+    infants_in_seat: Annotated[
+        int,
+        Field(description="Number of infants (under 2) occupying their own seat", ge=0),
+    ] = 0,
+    infants_on_lap: Annotated[
+        int,
+        Field(description="Number of lap infants (under 2, no seat)", ge=0),
+    ] = 0,
+    min_layover: Annotated[
+        int | None,
+        Field(description="Minimum layover duration in minutes.", ge=1),
+    ] = None,
+    max_layover: Annotated[
+        int | None,
+        Field(description="Maximum layover duration in minutes.", ge=1),
+    ] = None,
+    currency: Annotated[
+        str | None,
+        Field(description="ISO 4217 currency code (USD, EUR, GBP...) for prices."),
+    ] = None,
+    language: Annotated[
+        str | None,
+        Field(description="Optional BCP-47 language code (e.g., 'en-GB') for the `hl` URL param."),
+    ] = None,
+    country: Annotated[
+        str | None,
+        Field(description="Optional ISO 3166-1 alpha-2 country code (e.g., 'GB')."),
+    ] = None,
+    top_n: Annotated[
+        int,
+        Field(
+            description=(
+                "Options per leg expanded into the next leg. A k-leg trip loads "
+                "1 + n + ... + n^(k-1) pages (2 legs at n=3: 4 pages; 3 legs: 13), each "
+                f"taking a few seconds in a headless browser; over {MAX_MULTI_CITY_PAGES} "
+                "pages is refused. Raise it to see more combinations."
+            ),
+            ge=1,
+            le=10,
+        ),
+    ] = 3,
+) -> dict[str, Any]:
+    """Search multi-city and open-jaw trips, priced as one ticket like Google Flights.
+
+    Use this instead of separate `search_flights` calls when the trip does not
+    return to where it started, or has stops along the way: one multi-city
+    ticket is often much cheaper (or pricier) than the sum of one-ways, and only
+    this tool sees that price.
+
+    Each result is one complete trip with `price` for the whole itinerary,
+    every flight leg in order, and a `booking_url` that opens that exact trip on
+    Google Flights. `search_url` opens the multi-city board itself.
+
+    Runs Google Flights in a headless browser (multi-city results are not
+    reachable over plain HTTP), so it is slower than `search_flights` and
+    needs the `browser` extra; without it the call fails with
+    `error_type: unsupported_error` and install instructions.
+    """
+    params = MultiCitySearchParams(
+        legs=legs,
+        departure_window=departure_window,
+        airlines=airlines,
+        exclude_airlines=exclude_airlines,
+        alliance=alliance,
+        exclude_alliance=exclude_alliance,
+        cabin_class=cabin_class,
+        max_stops=max_stops,
+        sort_by=sort_by,
+        passengers=passengers or CONFIG.default_passengers,
+        children=children,
+        infants_in_seat=infants_in_seat,
+        infants_on_lap=infants_on_lap,
+        min_layover=min_layover,
+        max_layover=max_layover,
+        currency=currency,
+        language=language,
+        country=country,
+        top_n=top_n,
+    )
+    return _execute_multi_city_search(params)
 
 
 @mcp.tool(

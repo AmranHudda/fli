@@ -16,6 +16,7 @@ from fli.mcp.server import mcp
 
 EXPECTED_TOOLS = {
     "search_flights",
+    "search_multi_city",
     "search_dates",
     "search_explore",
     "find_airports",

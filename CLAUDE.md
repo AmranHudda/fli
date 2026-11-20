@@ -99,7 +99,7 @@ uv run mkdocs build         # Build static docs
    - All models use Pydantic for validation
 
 5. **MCP Server** (`fli/mcp/`)
-   - FastMCP-based server with five tools: `search_flights`, `search_dates`, `search_explore`, `get_booking_options`, `find_airports`
+   - FastMCP-based server with six tools: `search_flights`, `search_multi_city`, `search_dates`, `search_explore`, `get_booking_options`, `find_airports`
    - Industry-standard parameter naming: `origin`, `destination`, `cabin_class`, `max_stops`
    - Per-flight booking deep-link URLs (`tfs` protobuf) in every search result
    - Prompt templates for guided searches
@@ -136,7 +136,21 @@ Consequences to keep in mind when changing search code:
 - Airline include/exclude, price cap, max duration and departure windows are
   applied after fetching by `apply_client_side_filters()`; stops, cabin,
   passengers, alliances and layover bounds are encoded into the request.
-- Multi-city raises `SearchUnsupportedError` — the page inlines no rows for it.
+- Multi-city goes through `fli/search/_browser.py`: the page inlines no rows
+  for it, so a headless Chrome (Playwright, optional `browser` extra) loads the
+  same `tfs` URL (field 19 = 3) and returns the body of the `GetShoppingResults`
+  RPC that Google's own script signs and sends. `build_tfs` still refuses
+  multi-city unless called with `allow_multi_city=True`, so the HTTP path can't
+  silently serve an empty board. One browser per process, on a private event
+  loop thread; `fetch_shopping_body` is thread-safe. Offline tests can never
+  reach it: `tests/conftest.py` replaces `fetch_shopping_body` with a refusal
+  outside `live` tests. Expansion costs `1 + n + ... + n^(k-1)` pages
+  (`multi_city_page_count`), refused above `MAX_MULTI_CITY_PAGES` (60).
+- A round-trip or multi-city combination's price is the **last** segment's
+  price (`combo_price` / `combo_price_segment` in `fli/search/flights.py`): the
+  first board quotes the cheapest total each outbound can reach, the pinned
+  board quotes the exact total per combination. CLI and MCP report that, and
+  `search` sorts combinations by it for `CHEAPEST`.
 - `get_booking_options` hits `GetBookingResults`, which is still gated, so it
   currently raises `SearchRejectedError`. Booking deep links (`tfs`) are built
   offline and unaffected.
@@ -240,6 +254,26 @@ search results. The top-level `booking_url` is a broader search-page link
 (route + dates pre-filled) kept as a reliable fallback. Each flight's
 `flight_number` can be passed to `get_booking_options` for per-vendor
 pricing.
+
+### `search_multi_city`
+Multi-city and open-jaw trips (2-6 legs) priced as one ticket. Runs in the
+headless browser (see "Search transport"), so it is slower than
+`search_flights` and needs the `browser` extra; without it the response is
+`unsupported_error` with install steps.
+
+**Key Parameters:**
+- `legs` - Ordered list of `{origin, destination, departure_date}` (2-6)
+- `top_n` - Options per leg expanded into the next (default 3, 1-10); a k-leg
+  trip loads `1 + n + ... + n^(k-1)` pages, refused above 60
+- `cabin_class`, `max_stops`, `sort_by`, `departure_window`, `airlines`,
+  `exclude_airlines`, `alliance`, `exclude_alliance`, `min_layover`,
+  `max_layover`, passenger counts, `currency` / `language` / `country` - Same
+  as `search_flights`
+
+**Response:** `flights[]`, each a whole trip with `price` (the trip total),
+every leg in order and a `booking_url` deep link (`tfs` field 19 = 3) that
+opens that exact itinerary's booking page. `search_url` opens the multi-city
+board; `pages_loaded` reports the browser cost.
 
 ### `search_dates`
 Find cheapest travel dates within a range.

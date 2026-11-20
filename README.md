@@ -51,6 +51,7 @@ The MCP server provides these main tools:
 | Tool                 | Description                                                 |
 |----------------------|-------------------------------------------------------------|
 | **`search_flights`** | Search for flights on a specific date with detailed filters |
+| **`search_multi_city`** | Multi-city and open-jaw trips priced as one ticket (needs the `browser` extra) |
 | **`search_dates`**   | Find the cheapest travel dates across a flexible date range |
 | **`search_explore`** | Discover cheap destinations from an origin ("fly anywhere") |
 
@@ -166,6 +167,16 @@ pipx install flights
 fli --help
 ```
 
+Multi-city search runs Google Flights in a headless browser, so it needs the
+optional `browser` extra (it uses your installed Google Chrome, or Playwright's
+bundled Chromium if Chrome is missing):
+
+```bash
+pip install 'flights[browser]'
+# only if Google Chrome is not installed:
+playwright install chromium
+```
+
 ![CLI Demo](https://raw.githubusercontent.com/punitarani/fli/main/docs/assets/cli-demo.png)
 
 ## Features
@@ -215,9 +226,21 @@ What that means in practice:
   passengers, alliances and layover bounds ride in the request; airline
   include/exclude, price cap, max duration and departure windows are applied to
   the results after fetching.
-* **Multi-city raises `SearchUnsupportedError`.** Google loads those results
-  client-side through the gated RPC, so the page carries no rows to read.
-  Search each leg separately.
+* **Multi-city runs in a headless browser.** Google loads those results
+  client-side through the gated RPC, so the page carries no rows to read over
+  plain HTTP. With the `browser` extra installed, fli loads the multi-city page
+  in a real headless Chrome, lets Google's own script make (and sign) that
+  request, and decodes the response. Each board takes a few seconds, and a
+  k-leg trip loads `1 + n + ... + n^(k-1)` boards for `top_n = n`, so multi-city
+  is slower than other searches. Without the extra it raises
+  `BrowserUnavailableError` (a `SearchUnsupportedError`) with install steps.
+  Settings: `FLI_BROWSER_CHANNEL` (default `chrome`), `FLI_BROWSER_HEADLESS=0`
+  to watch it, `FLI_BROWSER_PAGES` (concurrent pages, default 4) and
+  `FLI_BROWSER_TIMEOUT` (seconds per page, default 30).
+* **Round-trip and multi-city prices come from the last direction's board.**
+  The first board lists the cheapest total each outbound can be part of; the
+  next board, fetched with that outbound pinned, quotes the exact total for
+  each combination. Results report and sort by that total.
 * **`get_booking_options` is unavailable.** It calls `GetBookingResults`, which
   is gated the same way, and currently raises `SearchRejectedError`. The
   per-flight `tfs` booking deep links are built offline and still work.
@@ -333,9 +356,18 @@ fli dates JFK LHR \
 
 ### Multi-city Search
 
+Prices are for the whole trip on one ticket, the way Google Flights quotes
+multi-city. Needs the `browser` extra (see Quick Start).
+
 ```bash
 # Two-leg multi-city trip
 fli multi --leg SEA,HKG,2026-12-26 --leg PEK,SEA,2027-01-02
+
+# Open jaw: fly into Rome, home from Milan, as JSON
+fli multi -l BOS,FCO,2027-05-10 -l MXP,BOS,2027-05-24 --format json
+
+# Expand more first-leg options (default 3)
+fli multi -l BOS,FCO,2027-05-10 -l MXP,BOS,2027-05-24 --top-n 6
 
 # Three-leg multi-city trip with filters
 fli multi \
@@ -422,6 +454,9 @@ fli multi \
 | `--children`     | Number of children (ages 2-11)       | `1`                             |
 | `--infants-in-seat` | Number of infants occupying their own seat | `1`                     |
 | `--infants-on-lap` | Number of lap infants (must be ≤ adults) | `1`                       |
+| `--top-n, -n`    | Options per leg expanded into the next leg (default 3) | `5`              |
+| `--currency`     | Currency for prices                  | `USD`, `EUR`                   |
+| `--format`       | Output format                        | `text`, `json`                 |
 
 ## MCP Server Integration
 

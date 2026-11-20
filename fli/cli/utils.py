@@ -20,6 +20,7 @@ from fli.core.parsers import ParseError
 from fli.core.parsers import parse_airlines as core_parse_airlines
 from fli.core.parsers import parse_max_stops as core_parse_max_stops
 from fli.models import Airline, Airport, MaxStops, TripType, display_name
+from fli.search.flights import combo_price_segment
 
 
 def validate_currency(
@@ -270,12 +271,15 @@ def serialize_flight_result(
 
     segments = list(flight_data)
 
+    # The board for the last direction quotes the whole combination; the
+    # outbound's own price is only the cheapest total it can be part of.
+    price_segment = combo_price_segment(flight_data)
+
     if len(segments) == 2:
-        # Round-trip: Google Flights returns the full RT price on the outbound leg.
         outbound, return_flight = segments
         out = {
-            "price": outbound.price,
-            "currency": outbound.currency or default_currency,
+            "price": price_segment.price,
+            "currency": price_segment.currency or default_currency,
             "duration": outbound.duration + return_flight.duration,
             "stops": outbound.stops + return_flight.stops,
             "outbound": _serialize_flight_segment_result(outbound),
@@ -285,8 +289,6 @@ def serialize_flight_result(
             out["booking_url"] = booking_url
         return out
 
-    # Multi-city (3+ legs): combined price is on the final leg.
-    price_segment = segments[-1]
     out = {
         "price": price_segment.price,
         "currency": price_segment.currency or default_currency,
@@ -445,9 +447,9 @@ def display_flight_results(
         table.add_column("Label", style="blue")
         table.add_column("Value", style="green")
 
-        # Google Flights returns the full trip price on the outbound leg for round-trips,
-        # and on the final leg for multi-city trips.
-        price_segment = flight_segments[-1] if is_multi_city else flight_segments[0]
+        # The last direction's board quotes the whole trip, for round trips
+        # and multi-city alike (see fli.search.flights.combo_price).
+        price_segment = combo_price_segment(tuple(flight_segments))
         total_price = price_segment.price
         table.add_row(
             "Total Price", format_price(total_price, price_segment.currency or default_currency)

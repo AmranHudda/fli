@@ -252,7 +252,7 @@ def _to_urlsafe_b64(data: bytes) -> str:
 #   2  = 2 (constant)           9  = cabin class
 #   3  = segment, repeated      14 = 1 (constant)
 #   3.2  = departure date       16 = max-uint64 pin (deep links only)
-#   3.4  = selected leg, rep.   19 = 2 one-way / multi-city, 1 round-trip
+#   3.4  = selected leg, rep.   19 = 1 round-trip, 2 one-way, 3 multi-city
 #   3.5  = stop ceiling
 #   3.6  = carrier include, repeated (IATA code or alliance name)
 #   3.7  = carrier exclude, repeated (same values as 3.6)
@@ -264,6 +264,12 @@ def _to_urlsafe_b64(data: bytes) -> str:
 # ``.reverse-eng/notes/booking_results.md``.
 
 _MAX_U64 = (1 << 64) - 1
+
+# Field 19 values: the trip type, as Google's own search and booking URLs
+# write it.
+TRIP_CODE_ROUND_TRIP = 1
+TRIP_CODE_ONE_WAY = 2
+TRIP_CODE_MULTI_CITY = 3
 
 # Passenger kinds, in the order Google's repeated field 8 numbers them:
 # 1 = adult, 2 = child, 3 = infant on lap, 4 = infant in own seat.
@@ -413,14 +419,14 @@ def encode_tfs_payload(
     passengers: Sequence[int] = (1,),
     seat: int = 1,
     pin_max_u64: bool = False,
+    trip_code: int | None = None,
 ) -> str:
     """Wrap encoded segments in the ``tfs`` envelope and base64 it.
 
     Args:
         segments: Concatenated output of :func:`encode_tfs_segment`.
         is_one_way: ``True`` for one-way, ``False`` for round-trip.
-            Controls field 19. Multi-city is a third value (3) that the
-            search page cannot serve — see :func:`fli.search._tfs.build_tfs`.
+            Controls field 19 unless ``trip_code`` is given.
         passengers: Passenger kind codes, one entry per traveller
             (1 = adult, 2 = child, 3 = infant on lap, 4 = infant in own
             seat). The two infant codes are the ones to get right: a lap
@@ -431,6 +437,11 @@ def encode_tfs_payload(
         seat: Cabin class (1 = economy, 2 = premium, 3 = business, 4 = first).
         pin_max_u64: Emit the field 16 constant that booking deep links
             carry. The search page does not need it.
+        trip_code: Explicit field 19 value, overriding ``is_one_way``. Use
+            :data:`TRIP_CODE_MULTI_CITY` for multi-city: the search page
+            renders that board, but loads its rows through the gated RPC, so
+            only the browser transport can read them (see
+            :mod:`fli.search._browser`).
 
     Returns:
         URL-safe base64 string with padding stripped.
@@ -442,7 +453,9 @@ def encode_tfs_payload(
     payload += _varint_field(9, seat) + _varint_field(14, 1)
     if pin_max_u64:
         payload += _length_delim(16, _varint_field(1, _MAX_U64))
-    payload += _varint_field(19, 2 if is_one_way else 1)
+    if trip_code is None:
+        trip_code = TRIP_CODE_ONE_WAY if is_one_way else TRIP_CODE_ROUND_TRIP
+    payload += _varint_field(19, trip_code)
     return _to_urlsafe_b64(payload)
 
 
@@ -452,6 +465,7 @@ def build_tfs_token(
     is_one_way: bool = True,
     passengers: Sequence[int] = (1,),
     seat: int = 1,
+    trip_code: int | None = None,
 ) -> str:
     """Build the ``tfs`` query parameter for a Google Flights deep-link URL.
 
@@ -477,6 +491,10 @@ def build_tfs_token(
         seat: Cabin class encoded in field 9.  ``1`` = economy, ``2`` =
             premium economy, ``3`` = business, ``4`` = first.  Defaults to
             economy so existing callers keep producing the captured tokens.
+        trip_code: Explicit field 19 value (see :func:`encode_tfs_payload`).
+            Pass :data:`TRIP_CODE_MULTI_CITY` for a multi-city or open-jaw
+            itinerary; without it a two-direction itinerary is encoded as a
+            round trip.
 
     Returns:
         URL-safe base64 string (no ``=`` padding) suitable for use as the
@@ -497,5 +515,10 @@ def build_tfs_token(
         for seg in segments
     )
     return encode_tfs_payload(
-        encoded, is_one_way=is_one_way, passengers=passengers, seat=seat, pin_max_u64=True
+        encoded,
+        is_one_way=is_one_way,
+        passengers=passengers,
+        seat=seat,
+        pin_max_u64=True,
+        trip_code=trip_code,
     )
